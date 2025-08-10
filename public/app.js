@@ -1,10 +1,58 @@
+// Whisper API Client
+class WhisperClient {
+    constructor() {
+        this.baseURL = 'http://localhost:5001'; // Whisper server URL (changed from 5000 to 5001)
+    }
+
+    async checkServerHealth() {
+        try {
+            const response = await fetch(`${this.baseURL}/health`);
+            const data = await response.json();
+            return data.status === 'ready';
+        } catch (error) {
+            console.error('Whisper server not available:', error);
+            return false;
+        }
+    }
+
+    async transcribeAudio(audioBlob) {
+        try {
+            const formData = new FormData();
+            formData.append('audio', audioBlob, 'audio.webm');
+            formData.append('language', 'id'); // Indonesian
+            formData.append('task', 'transcribe');
+
+            const response = await fetch(`${this.baseURL}/transcribe`, {
+                method: 'POST',
+                body: formData
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+
+            return await response.json();
+        } catch (error) {
+            console.error('Whisper transcription error:', error);
+            throw error;
+        }
+    }
+}
+
 class ScreenAudioToText {
     constructor() {
         this.socket = io();
         this.mediaStream = null;
+        this.mediaRecorder = null;
         this.recognition = null;
         this.isRecording = false;
         this.transcriptions = [];
+        
+        // Whisper integration
+        this.useWhisper = true;
+        this.whisperReady = false;
+        this.whisperClient = null;
+        this.audioChunks = [];
         
         // Audio analysis for music detection
         this.audioContext = null;
@@ -15,19 +63,19 @@ class ScreenAudioToText {
         
         this.initializeElements();
         this.initializeSocketEvents();
-        this.initializeSpeechRecognition();
+        this.initializeSpeechRecognition(); // Fallback only
         this.bindEvents();
         
-        this.log('🚀 Application initialized - Web Speech API mode', 'info');
+        this.log('🚀 Application initialized - Whisper API mode', 'info');
     }
     
     initializeElements() {
-        // Buttons
+        // Control buttons
         this.startBtn = document.getElementById('startShareBtn');
         this.stopBtn = document.getElementById('stopShareBtn');
         this.toggleAudioBtn = document.getElementById('toggleAudioBtn');
-        this.clearTranscriptBtn = document.getElementById('clearTranscriptBtn');
         this.downloadBtn = document.getElementById('downloadBtn');
+        this.clearBtn = document.getElementById('clearBtn');
         this.clearLogsBtn = document.getElementById('clearLogsBtn');
         
         // Display areas
@@ -35,6 +83,14 @@ class ScreenAudioToText {
         this.transcriptionArea = document.getElementById('transcriptionArea');
         this.logsArea = document.getElementById('logsArea');
         this.previewVideo = document.getElementById('previewVideo');
+        
+        // Validate critical elements
+        if (!this.transcriptionArea) {
+            console.error('❌ Critical: transcriptionArea element not found!');
+            this.log('❌ Critical: transcript area element missing from DOM', 'error');
+        } else {
+            this.log('✅ All DOM elements initialized successfully', 'success');
+        }
     }
     
     initializeSocketEvents() {
@@ -46,9 +102,73 @@ class ScreenAudioToText {
             this.log('Disconnected from server', 'warning');
         });
         
+        // Whisper events
+        this.socket.on('whisper-ready', (data) => {
+            this.whisperReady = true;
+            this.log('🎤 Whisper API ready - Real-time transcription active!', 'success');
+            this.updateStatus('🎤 Whisper Active - Processing Audio', true);
+        });
+        
+        this.socket.on('whisper-error', (data) => {
+            this.log(`❌ Whisper error: ${data.error}`, 'error');
+            this.updateStatus('❌ Whisper Error - Check connection', false);
+        });
+        
+        this.socket.on('whisper-transcription', (data) => {
+            this.log(`🎯 Whisper: "${data.text}" (${(data.confidence * 100).toFixed(1)}%)`, 'success');
+            
+            // Add transcription to UI
+            this.addTranscription({
+                text: data.text,
+                confidence: data.confidence,
+                timestamp: data.timestamp,
+                speaker: this.detectSpeaker(data.text),
+                provider: 'whisper',
+                language: data.language
+            });
+        });
+        
+        // Whisper transcription events
+        this.socket.on('whisper-transcription', (data) => {
+            this.log(`🤖 Whisper: "${data.text}"`, 'success');
+            
+            const transcriptionData = {
+                text: data.text,
+                confidence: data.confidence || 0.9, // Whisper usually has high confidence
+                timestamp: new Date().toISOString(),
+                isFinal: true,
+                speaker: this.detectSpeaker(data.text),
+                provider: 'whisper'
+            };
+            
+            this.addTranscription(transcriptionData);
+        });
+        
+        this.socket.on('whisper-error', (data) => {
+            this.log(`❌ Whisper error: ${data.error}`, 'error');
+            
+            // Fallback to Web Speech API on error
+            if (!this.recognition) {
+                this.initializeSpeechRecognition();
+            }
+            
+            if (this.recognition && !this.isRecording) {
+                try {
+                    this.recognition.start();
+                    this.isRecording = true;
+                    this.log('🔄 Falling back to Web Speech API due to Whisper error', 'warning');
+                } catch (error) {
+                    this.log(`Failed to start fallback recognition: ${error.message}`, 'error');
+                }
+            }
+        });
+        
+        // Legacy Web Speech API events (fallback)
         this.socket.on('new-transcription', (data) => {
-            this.log(`📱 New transcription from ${data.socketId}`, 'info');
-            this.addTranscription(data);
+            if (data.provider === 'web-speech-api') {
+                this.log(`📱 Fallback transcription from ${data.socketId}`, 'info');
+                this.addTranscription(data);
+            }
         });
         
         this.socket.on('screen-share-started', (data) => {
@@ -61,56 +181,35 @@ class ScreenAudioToText {
     }
     
     initializeSpeechRecognition() {
-        // Check for browser support
+        // Fallback Web Speech API (only used if Whisper fails)
         if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-            this.log('Speech recognition not supported in this browser', 'error');
+            this.log('Speech recognition not supported in this browser', 'warning');
             return;
         }
         
-        // Initialize Speech Recognition
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
         this.recognition = new SpeechRecognition();
         
-        // Configure recognition untuk MAXIMUM AGGRESSIVENESS (Interview mode)
+        // ULTRA RESPONSIVE SETTINGS for real-time experience
         this.recognition.continuous = true;
         this.recognition.interimResults = true;
-        this.recognition.lang = 'id-ID'; // Indonesian, bisa diganti ke 'en-US' untuk English
-        this.recognition.maxAlternatives = 3; // Ambil 3 alternatif untuk akurasi lebih baik
+        this.recognition.lang = 'id-ID';
+        this.recognition.maxAlternatives = 1; // Focus on single best result
         
-        // AGGRESSIVE SETTINGS untuk interview
-        // Tidak ada pause detection - langsung capture semua
-        this.interviewMode = true;
-        
-        this.recognition.onstart = () => {
-            this.log('🎤 Speech recognition started', 'success');
-        };
+        // Aggressive settings for instant capture
+        this.currentInterimText = '';
+        this.interimTimeout = null;
         
         this.recognition.onresult = (event) => {
-            // Check if music is detected - suppress transcription if so
-            if (this.suppressTranscription) {
-                this.log('🚫 Transcription suppressed due to music detection', 'warning');
-                return;
-            }
+            // Only use if Whisper is not available
+            if (this.useWhisper && this.whisperReady) return;
             
-            // INTERVIEW MODE: Capture everything aggressively (only for speech)
             for (let i = event.resultIndex; i < event.results.length; i++) {
                 const transcript = event.results[i][0].transcript;
                 const confidence = event.results[i][0].confidence;
                 
-                // Additional filter: ignore very low confidence (likely music/noise)
-                if (confidence && confidence < 0.5) {
-                    this.log(`🚫 Low confidence ignored: "${transcript}" (${(confidence * 100).toFixed(1)}%)`, 'warning');
-                    continue;
-                }
-                
                 if (event.results[i].isFinal) {
-                    // Additional check: filter out music-like patterns
-                    if (this.isLikelyMusic(transcript)) {
-                        this.log(`🎵 Music-like transcript ignored: "${transcript}"`, 'warning');
-                        continue;
-                    }
-                    
-                    // IMMEDIATE CAPTURE - no waiting for pauses
+                    // Final result - commit to transcript
                     const transcriptionData = {
                         text: transcript.trim(),
                         confidence: confidence || 0,
@@ -120,18 +219,19 @@ class ScreenAudioToText {
                         provider: 'web-speech-api'
                     };
                     
-                    // Send to server immediately
-                    this.socket.emit('transcription', transcriptionData);
-                    
-                    // Add to UI immediately - no sentence building delay
+                    // Clear interim display and add final result
+                    this.clearInterimDisplay();
                     this.addTranscription(transcriptionData);
                     
-                    this.log(`🎤 CAPTURED: "${transcript.trim()}" (${(confidence * 100).toFixed(1)}%)`, 'success');
+                    // Send to server
+                    this.socket.emit('transcription', transcriptionData);
+                    
+                    this.log(`🎤 FINAL: "${transcript.trim()}"`, 'success');
                 } else {
-                    // Show interim aggressively for live feedback (only if not music)
-                    if (transcript.trim().length > 2 && !this.isLikelyMusic(transcript)) {
-                        this.log(`⚡ Live: "${transcript.trim()}"`, 'info');
-                        this.showInterimResult(transcript.trim());
+                    // Interim result - show live typing animation
+                    if (transcript.trim().length > 1) {
+                        this.showInterimTranscription(transcript.trim());
+                        this.log(`⚡ LIVE: "${transcript.trim()}"`, 'info');
                     }
                 }
             }
@@ -139,29 +239,6 @@ class ScreenAudioToText {
         
         this.recognition.onerror = (event) => {
             this.log(`Speech recognition error: ${event.error}`, 'error');
-        };
-        
-        this.recognition.onend = () => {
-            this.log('🛑 Speech recognition ended - AGGRESSIVE RESTART', 'warning');
-            // IMMEDIATE restart for interview mode - no delays
-            if (this.isRecording) {
-                setTimeout(() => {
-                    try {
-                        this.recognition.start();
-                        this.log('🔄 Recognition restarted for continuous capture', 'info');
-                    } catch (error) {
-                        this.log(`Failed to restart recognition: ${error.message}`, 'error');
-                        // Try again after short delay
-                        setTimeout(() => {
-                            try {
-                                this.recognition.start();
-                            } catch (e) {
-                                this.log(`Second restart attempt failed: ${e.message}`, 'error');
-                            }
-                        }, 200);
-                    }
-                }, 50); // Very short delay for immediate restart
-            }
         };
     }
     
@@ -256,13 +333,45 @@ class ScreenAudioToText {
         }
     }
     
-    startRecording() {
+    async startRecording() {
         if (!this.mediaStream) {
             this.log('No media stream available for recording', 'error');
             return;
         }
         
-        // Initialize audio analysis untuk music detection
+        // Initialize Whisper client first
+        this.whisperClient = new WhisperClient();
+        this.whisperReady = await this.whisperClient.checkServerHealth();
+        
+        if (this.whisperReady) {
+            this.log('🤖 Whisper server is ready - using Whisper API', 'success');
+            this.useWhisper = true;
+            
+            // Setup MediaRecorder for Whisper
+            this.setupMediaRecorderForWhisper(this.mediaStream);
+            
+            // Start continuous audio streaming to Whisper
+            this.startWhisperTranscription();
+        } else {
+            this.log('⚠️ Whisper server not available - falling back to Web Speech API', 'warning');
+            this.useWhisper = false;
+            
+            // Initialize Web Speech API as fallback
+            this.initializeSpeechRecognition();
+            
+            // Start Web Speech API
+            if (this.recognition) {
+                try {
+                    this.recognition.start();
+                    this.isRecording = true;
+                    this.log('🎤 Web Speech API started as fallback', 'info');
+                } catch (error) {
+                    this.log(`Failed to start Web Speech API: ${error.message}`, 'error');
+                }
+            }
+        }
+        
+        // Initialize audio analysis for music detection (common for both methods)
         this.initializeAudioAnalysis();
         
         // Check if we have audio tracks
@@ -273,17 +382,7 @@ class ScreenAudioToText {
         }
         
         this.log(`Found ${audioTracks.length} audio track(s)`, 'success');
-        
-        // Start Web Speech API
-        if (this.recognition) {
-            try {
-                this.recognition.start();
-                this.isRecording = true;
-                this.log('🎤 Web Speech API started for voice recognition', 'success');
-            } catch (error) {
-                this.log(`Failed to start speech recognition: ${error.message}`, 'error');
-            }
-        }
+        this.isRecording = true;
     }
     
     async toggleAudioSource() {
@@ -357,7 +456,12 @@ class ScreenAudioToText {
                 this.audioContext = null;
             }
             
-            // Stop speech recognition
+            // Stop Whisper transcription if active
+            if (this.useWhisper && this.mediaRecorder) {
+                this.stopWhisperTranscription();
+            }
+            
+            // Stop speech recognition (fallback)
             if (this.recognition && this.isRecording) {
                 this.recognition.stop();
                 this.isRecording = false;
@@ -375,6 +479,12 @@ class ScreenAudioToText {
             
             // Clear video
             this.previewVideo.srcObject = null;
+            
+            // Reset Whisper state
+            this.useWhisper = false;
+            this.whisperReady = false;
+            this.audioChunks = [];
+            this.mediaRecorder = null;
             
             // Update UI
             this.updateStatus('Screen sharing stopped', false);
@@ -556,41 +666,44 @@ class ScreenAudioToText {
     }
     
     addTranscription(data) {
-        // Remove interim result when final comes in
-        const existingInterim = document.getElementById('interim-result');
-        if (existingInterim) {
-            existingInterim.remove();
+        // Check if transcriptArea exists
+        if (!this.transcriptArea) {
+            this.log('⚠️ Transcript area not found, reinitializing...', 'warning');
+            this.transcriptArea = document.getElementById('transcriptionArea');
+            if (!this.transcriptArea) {
+                this.log('❌ Failed to find transcript area element', 'error');
+                return;
+            }
         }
+        
+        // Remove interim result when final comes in
+        this.clearInterimDisplay();
         
         this.transcriptions.push(data);
         
-        const transcriptionItem = document.createElement('div');
-        transcriptionItem.className = 'transcription-item';
+        // Create transcript entry with new styling
+        const transcriptEntry = document.createElement('div');
+        transcriptEntry.className = 'transcript-entry';
         
-        const meta = document.createElement('div');
-        meta.className = 'transcription-meta';
-        const speakerLabel = data.speaker === 'INTERVIEWER' ? '❓ INTERVIEWER' : '💬 SPEAKER';
-        const providerLabel = data.provider === 'web-speech-api' ? '📱 WebSpeech' : '🎯 Other';
-        meta.textContent = `${new Date(data.timestamp).toLocaleTimeString()} - ${speakerLabel} - ${providerLabel}`;
-        
-        const text = document.createElement('div');
-        text.className = 'transcription-text';
-        text.textContent = data.text;
-        
-        // Highlight interviewer questions
+        // Add special styling for interviewer
         if (data.speaker === 'INTERVIEWER') {
-            transcriptionItem.style.borderLeft = '4px solid #dc3545'; // Red for questions
-            transcriptionItem.style.backgroundColor = '#fff5f5';
-            text.style.fontWeight = 'bold';
+            transcriptEntry.style.borderLeft = '4px solid #dc3545';
+            transcriptEntry.style.backgroundColor = '#fff5f5';
         }
         
-        const confidence = document.createElement('div');
-        confidence.className = 'confidence';
-        confidence.textContent = `Confidence: ${(data.confidence * 100).toFixed(1)}%`;
+        const timestamp = new Date(data.timestamp).toLocaleTimeString();
+        const speakerLabel = data.speaker === 'INTERVIEWER' ? '❓ INTERVIEWER' : '💬 SPEAKER';
+        const providerLabel = data.provider === 'web-speech-api' ? '📱 WebSpeech' : 
+                            data.provider === 'whisper' ? '🤖 Whisper' : '🎯 Other';
         
-        transcriptionItem.appendChild(meta);
-        transcriptionItem.appendChild(text);
-        transcriptionItem.appendChild(confidence);
+        transcriptEntry.innerHTML = `
+            <div class="transcript-header">
+                <span class="transcript-time">${timestamp}</span>
+                <span class="transcript-speaker" style="background: ${data.speaker === 'INTERVIEWER' ? '#dc3545' : '#007bff'}">${speakerLabel}</span>
+                <span class="transcript-provider">${providerLabel} (${(data.confidence * 100).toFixed(1)}%)</span>
+            </div>
+            <div class="transcript-text ${data.speaker === 'INTERVIEWER' ? 'interviewer-text' : ''}">${data.text}</div>
+        `;
         
         // Remove placeholder if exists
         if (this.transcriptionArea.children.length === 1 && 
@@ -598,7 +711,18 @@ class ScreenAudioToText {
             this.transcriptionArea.innerHTML = '';
         }
         
-        this.transcriptionArea.appendChild(transcriptionItem);
+        // Add with fade-in animation
+        transcriptEntry.style.opacity = '0';
+        transcriptEntry.style.transform = 'translateY(10px)';
+        this.transcriptionArea.appendChild(transcriptEntry);
+        
+        // Animate in
+        setTimeout(() => {
+            transcriptEntry.style.transition = 'opacity 0.3s ease-out, transform 0.3s ease-out';
+            transcriptEntry.style.opacity = '1';
+            transcriptEntry.style.transform = 'translateY(0)';
+        }, 10);
+        
         this.transcriptionArea.scrollTop = this.transcriptionArea.scrollHeight;
     }
     
@@ -645,6 +769,118 @@ class ScreenAudioToText {
             this.statusDiv.textContent = 'Status: 🎵 Music Detected - Transcription Paused';
         } else {
             this.statusDiv.className = `status ${isActive ? 'active' : 'inactive'}`;
+        }
+    }
+
+    setupMediaRecorderForWhisper(stream) {
+        const audioTracks = stream.getAudioTracks();
+        if (audioTracks.length === 0) {
+            this.log('No audio tracks available for Whisper', 'warning');
+            return;
+        }
+
+        // Create audio-only stream for Whisper
+        const audioStream = new MediaStream(audioTracks);
+        
+        this.mediaRecorder = new MediaRecorder(audioStream, {
+            mimeType: 'audio/webm;codecs=opus',
+            audioBitsPerSecond: 16000
+        });
+
+        this.audioChunks = [];
+
+        this.mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) {
+                this.audioChunks.push(event.data);
+                
+                // Send audio chunk to server for Whisper processing
+                if (this.socket) {
+                    event.data.arrayBuffer().then(buffer => {
+                        this.socket.emit('audio-data', {
+                            audio: Array.from(new Uint8Array(buffer)),
+                            timestamp: Date.now()
+                        });
+                    });
+                }
+            }
+        };
+
+        this.mediaRecorder.onerror = (event) => {
+            this.log(`MediaRecorder error: ${event.error}`, 'error');
+        };
+
+        this.log('MediaRecorder setup complete for Whisper', 'success');
+    }
+
+    startWhisperTranscription() {
+        if (!this.mediaRecorder) {
+            this.log('MediaRecorder not setup for Whisper', 'error');
+            return;
+        }
+
+        try {
+            // Start recording in small chunks for real-time processing
+            this.mediaRecorder.start(1000); // 1 second chunks
+            this.isRecording = true;
+            this.log('🎤 Whisper transcription started', 'success');
+        } catch (error) {
+            this.log(`Failed to start Whisper transcription: ${error.message}`, 'error');
+        }
+    }
+
+    stopWhisperTranscription() {
+        if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+            this.mediaRecorder.stop();
+            this.log('🛑 Whisper transcription stopped', 'info');
+        }
+    }
+
+    showInterimTranscription(text) {
+        // Check if transcriptArea exists
+        if (!this.transcriptArea) {
+            this.log('⚠️ Transcript area not found, reinitializing...', 'warning');
+            this.transcriptArea = document.getElementById('transcriptionArea');
+            if (!this.transcriptArea) {
+                this.log('❌ Failed to find transcript area element', 'error');
+                return;
+            }
+        }
+        
+        // Remove existing interim display
+        this.clearInterimDisplay();
+        
+        // Create interim display element
+        const interimDiv = document.createElement('div');
+        interimDiv.className = 'transcript-entry interim-transcript';
+        interimDiv.id = 'interim-display';
+        
+        const timestamp = new Date().toLocaleTimeString();
+        interimDiv.innerHTML = `
+            <div class="transcript-header">
+                <span class="transcript-time">${timestamp}</span>
+                <span class="transcript-speaker">🎤 LIVE</span>
+                <span class="transcript-provider">typing...</span>
+            </div>
+            <div class="transcript-text typing-animation">${text}</div>
+        `;
+        
+        // Add to transcript area
+        this.transcriptArea.appendChild(interimDiv);
+        this.transcriptArea.scrollTop = this.transcriptArea.scrollHeight;
+        
+        // Add typing animation class
+        setTimeout(() => {
+            const textElement = interimDiv.querySelector('.transcript-text');
+            if (textElement) {
+                textElement.classList.add('typing-active');
+            }
+        }, 50);
+    }
+
+    clearInterimDisplay() {
+        const existingInterim = document.getElementById('interim-display');
+        if (existingInterim) {
+            existingInterim.remove();
         }
     }
     
