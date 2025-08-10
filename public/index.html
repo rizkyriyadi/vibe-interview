@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Screen Audio to Text</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        
+        .controls {
+            text-align: center;
+            margin: 20px 0;
+        }
+        
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            margin: 0 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        
+        button:hover {
+            background-color: #0056b3;
+        }
+        
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+        
+        .status {
+            text-align: center;
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        
+        .status.inactive {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        
+        .status.active {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        
+        .status.music-detected {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 2px solid #ffc107;
+        }
+        
+        .transcription-area {
+            min-height: 300px;
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            padding: 15px;
+            margin: 20px 0;
+            overflow-y: auto;
+            max-height: 500px;
+        }
+        
+        .transcription-item {
+            background: white;
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 4px;
+            border-left: 4px solid #007bff;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        
+        .transcription-item.interim {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            opacity: 0.8;
+            animation: pulse 1s infinite;
+        }
+        
+        .transcription-item.interviewer {
+            background: #fff5f5 !important;
+            border-left: 4px solid #dc3545 !important;
+        }
+        
+        .transcription-item.interviewer .transcription-text {
+            font-weight: bold;
+            color: #721c24;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 0.6; }
+            50% { opacity: 1; }
+            100% { opacity: 0.6; }
+        }
+        
+        .transcription-meta {
+            font-size: 12px;
+            color: #6c757d;
+            margin-bottom: 5px;
+        }
+        
+        .transcription-text {
+            font-size: 16px;
+            color: #333;
+            line-height: 1.4;
+        }
+        
+        .confidence {
+            font-size: 12px;
+            color: #28a745;
+            font-weight: bold;
+        }
+        
+        .logs {
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        
+        .log-entry {
+            margin: 2px 0;
+            padding: 2px 0;
+        }
+        
+        .log-info { color: #4fc3f7; }
+        .log-error { color: #f44336; }
+        .log-success { color: #4caf50; }
+        .log-warning { color: #ff9800; }
+        
+        .preview-video {
+            width: 100%;
+            max-width: 400px;
+            background: #000;
+            border-radius: 4px;
+        }
+        
+        .video-container {
+            text-align: center;
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎤 Screen Audio to Text Converter</h1>
+    
+    <div class="container">
+        <h3>🎤 Web Speech API - Interview Mode</h3>
+        <div style="background: #fff3cd; padding: 15px; border-radius: 4px; margin: 10px 0; border-left: 4px solid #ffc107;">
+            <p><strong>⚠️ IMPORTANT: Web Speech API Limitations</strong></p>
+            <ul style="margin: 10px 0; padding-left: 20px;">
+                <li>🎧 <strong>Earphone Issue:</strong> Web Speech API uses microphone input only</li>
+                <li>🔊 <strong>Solution:</strong> Remove earphones to hear screen audio through speakers</li>
+                <li>🎤 <strong>Alternative:</strong> Use microphone mode for voice input</li>
+                <li>� <strong>Note:</strong> Screen audio capture is for visual only</li>
+            </ul>
+            <p><strong>How it works:</strong></p>
+            <ol style="margin: 10px 0; padding-left: 20px;">
+                <li>Screen sharing → Visual capture + (optional) audio track</li>
+                <li>Web Speech API → Uses microphone for speech recognition</li>
+                <li>Audio analysis → Detects music to suppress transcription</li>
+                <li>Real-time output → Live interim and final results</li>
+            </ol>
+        </div>
+    </div>
+    
+    <div class="container">
+        <h3>📺 Screen Sharing Control</h3>
+        <div class="controls">
+            <button id="startShareBtn">Start Screen Share</button>
+            <button id="stopShareBtn" disabled>Stop Screen Share</button>
+            <button id="toggleAudioBtn" disabled>🎤 Switch to Microphone</button>
+        </div>
+        
+        <div id="status" class="status inactive">
+            Status: Inactive
+        </div>
+        
+        <div class="video-container">
+            <video id="previewVideo" class="preview-video" autoplay muted></video>
+        </div>
+    </div>
+    
+    <div class="container">
+        <h3>📝 Real-time Transcription</h3>
+        <div class="controls">
+            <button id="clearTranscriptBtn">Clear Transcript</button>
+            <button id="downloadBtn">Download Transcript</button>
+        </div>
+        
+        <div id="transcriptionArea" class="transcription-area">
+            <p style="text-align: center; color: #6c757d; font-style: italic;">
+                Transcriptions will appear here when you start screen sharing...
+            </p>
+        </div>
+    </div>
+    
+    <div class="container">
+        <h3>📊 System Logs</h3>
+        <div class="controls">
+            <button id="clearLogsBtn">Clear Logs</button>
+        </div>
+        <div id="logsArea" class="logs">
+            <div class="log-entry log-info">[INFO] Application initialized</div>
+        </div>
+    </div>
+
+    <!-- Socket.IO -->
+    <script src="/socket.io/socket.io.js"></script>
+    
+    <!-- Main Application Script -->
+    <script src="app.js"></script>
+</body>
+</html>
